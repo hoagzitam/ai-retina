@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local dev DB (SQLite fallback when DATABASE_URL is not set)
+*.db
+*.sqlite3
+
+# Streamlit secrets (never commit real secrets)
+.streamlit/secrets.toml
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

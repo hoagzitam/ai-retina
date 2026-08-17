@@ -1,0 +1,7 @@
+streamlit>=1.45,<2
+pandas>=2.2,<3
+numpy>=1.26,<3
+Pillow>=10,<13
+SQLAlchemy>=2.0,<3
+psycopg[binary]>=3.2,<4
+supabase>=2,<3
