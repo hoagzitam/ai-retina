@@ -34,6 +34,8 @@ from sqlalchemy import (
     update,
 )
 
+from sqlalchemy.pool import NullPool
+
 from src.config import DATABASE_URL
 
 BIOMARKER_COLS = ["irf", "srf", "ped", "shrm", "hrf"]
@@ -111,17 +113,25 @@ live_votes = Table(
 @st.cache_resource(show_spinner=False)
 def _engine():
     if DATABASE_URL.startswith("sqlite"):
-        connect_args = {"check_same_thread": False}
-    else:
-        # Supabase's Transaction pooler (port 6543) multiplexes each logical
-        # connection across different physical backend connections. psycopg3
-        # auto-creates server-side prepared statements after a few repeated
-        # queries by default, which then collide/go stale as the backend
-        # connection changes underneath -- surfacing as
-        # `DuplicatePreparedStatement`. Disabling it keeps every query as a
-        # plain (simple) protocol query, which is what poolers expect.
-        connect_args = {"prepare_threshold": None}
-    return create_engine(DATABASE_URL, pool_pre_ping=True, connect_args=connect_args)
+        return create_engine(
+            DATABASE_URL, pool_pre_ping=True, connect_args={"check_same_thread": False}
+        )
+    # Supabase's Transaction pooler (port 6543) already pools connections at
+    # the PgBouncer/Supavisor layer, and rotates the physical backend
+    # connection under each logical one. Layering SQLAlchemy's own
+    # connection pool on top of that leads to stale server-side state
+    # (prepared statements created against one backend connection, then
+    # reused/looked up against a different one) -- surfacing as
+    # DuplicatePreparedStatement / InvalidSqlStatementName errors. NullPool
+    # opens a fresh DB connection for every checkout and closes it
+    # afterwards, so there is nothing left to go stale between requests.
+    # prepare_threshold=None additionally stops psycopg3 from creating any
+    # server-side prepared statements at all, as a second layer of safety.
+    return create_engine(
+        DATABASE_URL,
+        poolclass=NullPool,
+        connect_args={"prepare_threshold": None},
+    )
 
 
 def _now():
