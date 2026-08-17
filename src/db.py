@@ -110,7 +110,17 @@ live_votes = Table(
 
 @st.cache_resource(show_spinner=False)
 def _engine():
-    connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+    if DATABASE_URL.startswith("sqlite"):
+        connect_args = {"check_same_thread": False}
+    else:
+        # Supabase's Transaction pooler (port 6543) multiplexes each logical
+        # connection across different physical backend connections. psycopg3
+        # auto-creates server-side prepared statements after a few repeated
+        # queries by default, which then collide/go stale as the backend
+        # connection changes underneath -- surfacing as
+        # `DuplicatePreparedStatement`. Disabling it keeps every query as a
+        # plain (simple) protocol query, which is what poolers expect.
+        connect_args = {"prepare_threshold": None}
     return create_engine(DATABASE_URL, pool_pre_ping=True, connect_args=connect_args)
 
 
