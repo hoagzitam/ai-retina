@@ -30,6 +30,7 @@ from sqlalchemy import (
     delete,
     insert,
     select,
+    text,
     update,
 )
 
@@ -117,17 +118,54 @@ def _now():
     return datetime.now(timezone.utc)
 
 
+# Arbitrary constant used as a Postgres advisory lock key, just to serialize
+# schema creation if two processes ever call init_db() at nearly the same
+# moment (e.g. a Streamlit Cloud redeploy overlap).
+_ADVISORY_LOCK_KEY = 785421
+
+
+@st.cache_resource(show_spinner=False)
 def init_db():
-    metadata.create_all(_engine())
+    """Create tables if needed, and ensure the singleton live_session row exists.
+
+    Cached with st.cache_resource so this body runs at most once per running
+    app process -- Streamlit reruns the whole script on every interaction
+    and every new browser session, so without this, many concurrent first
+    page-loads could all race to CREATE TABLE at once and collide. The
+    Postgres advisory lock is a second layer of protection across process
+    boundaries; any duplicate-object error is swallowed since it only means
+    another process already finished the same setup.
+    """
+    eng = _engine()
+    is_pg = eng.dialect.name == "postgresql"
+    conn = eng.connect()
+    try:
+        if is_pg:
+            conn.execute(text("SELECT pg_advisory_lock(:k)"), {"k": _ADVISORY_LOCK_KEY})
+        try:
+            metadata.create_all(conn)
+            conn.commit()
+        except Exception:
+            conn.rollback()  # tables already exist (created by a concurrent process) -- fine
+        finally:
+            if is_pg:
+                conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _ADVISORY_LOCK_KEY})
+                conn.commit()
+    finally:
+        conn.close()
+
     # Make sure the singleton live_session row (id=1) always exists.
-    with _engine().begin() as conn:
-        row = conn.execute(select(live_session).where(live_session.c.id == 1)).mappings().first()
+    with eng.begin() as conn2:
+        row = conn2.execute(select(live_session).where(live_session.c.id == 1)).mappings().first()
         if row is None:
-            conn.execute(
-                insert(live_session).values(
-                    id=1, active_case_id=None, voting_open=False, reveal_results=False, updated_at=_now()
+            try:
+                conn2.execute(
+                    insert(live_session).values(
+                        id=1, active_case_id=None, voting_open=False, reveal_results=False, updated_at=_now()
+                    )
                 )
-            )
+            except Exception:
+                pass  # another process already inserted it -- fine
 
 
 def new_code(prefix: str = "USR") -> str:
