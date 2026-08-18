@@ -32,23 +32,27 @@ elif mode=='Live Conference':
     if 'live_code' not in st.session_state:st.session_state.live_code=new_code('LIVE')
     code=st.session_state.live_code;st.success(f'Participant Code: **{code}**')
     @st.fragment(run_every='2s')
-    def live_body():
-        sess=get_live_session();st.caption(('Waiting for moderator' if not sess['active_case_id'] else ('VOTING OPEN' if sess['voting_open'] else ('RESULTS REVEALED' if sess['reveal_results'] else 'CASE OPEN')))+' · auto-refresh 2 s')
-        if not sess['active_case_id']:
-            st.info('Moderator has not opened a case yet.');return
+    def live_watcher():
+        s=get_live_session();sig=(s['active_case_id'],s['voting_open'],s['reveal_results'])
+        if st.session_state.get('live_sig')!=sig:st.session_state['live_sig']=sig;st.rerun()
+    live_watcher()
+    sess=get_live_session();st.session_state['live_sig']=(sess['active_case_id'],sess['voting_open'],sess['reveal_results'])
+    st.caption('Waiting for moderator' if not sess['active_case_id'] else ('VOTING OPEN' if sess['voting_open'] else ('RESULTS REVEALED' if sess['reveal_results'] else 'CASE OPEN')))
+    if not sess['active_case_id']:
+        st.info('Moderator has not opened a case yet.')
+    else:
         row=CASES[CASES.case_id==sess['active_case_id']].iloc[0];show_case(row,True);existing=get_live_vote(code,row.case_id)
         if sess['voting_open']:
             with st.form(f'live_{row.case_id}'):
                 diag=st.radio('Diagnosis',DIAGNOSES,index=(DIAGNOSES.index(existing['diagnosis']) if existing and existing['diagnosis'] in DIAGNOSES else None),horizontal=True);mgmt=st.radio('Management',MANAGEMENT,index=(MANAGEMENT.index(existing['management']) if existing and existing['management'] in MANAGEMENT else None),horizontal=True);cf=st.select_slider('Confidence',CONF,value=(int(existing['confidence']) if existing else 3));go=st.form_submit_button('Submit / update live vote',type='primary')
             if go:
                 if diag is None or mgmt is None:st.error('Complete diagnosis and management.')
-                else:save_live_vote(code,row.case_id,diag,mgmt,cf);st.success('Vote recorded.');st.rerun(scope='fragment')
+                else:save_live_vote(code,row.case_id,diag,mgmt,cf);st.success('Vote recorded.');st.rerun()
         else:st.warning('Voting is closed.')
         if sess['reveal_results']:
             V=frames()['live'];v=V[V.case_id==row.case_id];st.subheader('Live results');st.metric('Votes',len(v));
             if not v.empty:st.bar_chart(v.management.value_counts())
             st.write(f'Expert: **{row.expert_management}** · TIDE: **{row.tide_management}**')
-    live_body()
 elif mode=='Self-Learning':
     st.header('Self-Learning')
     if 'learning_uid' not in st.session_state:
