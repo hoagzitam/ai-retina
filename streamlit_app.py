@@ -32,23 +32,23 @@ elif mode=='Live Conference':
     if 'live_code' not in st.session_state:st.session_state.live_code=new_code('LIVE')
     code=st.session_state.live_code;st.success(f'Participant Code: **{code}**')
     @st.fragment(run_every='2s')
-    def live_status():
+    def live_body():
         sess=get_live_session();st.caption(('Waiting for moderator' if not sess['active_case_id'] else ('VOTING OPEN' if sess['voting_open'] else ('RESULTS REVEALED' if sess['reveal_results'] else 'CASE OPEN')))+' · auto-refresh 2 s')
-    live_status();sess=get_live_session()
-    if not sess['active_case_id']:st.info('Moderator has not opened a case yet.')
-    else:
+        if not sess['active_case_id']:
+            st.info('Moderator has not opened a case yet.');return
         row=CASES[CASES.case_id==sess['active_case_id']].iloc[0];show_case(row,True);existing=get_live_vote(code,row.case_id)
         if sess['voting_open']:
             with st.form(f'live_{row.case_id}'):
                 diag=st.radio('Diagnosis',DIAGNOSES,index=(DIAGNOSES.index(existing['diagnosis']) if existing and existing['diagnosis'] in DIAGNOSES else None),horizontal=True);mgmt=st.radio('Management',MANAGEMENT,index=(MANAGEMENT.index(existing['management']) if existing and existing['management'] in MANAGEMENT else None),horizontal=True);cf=st.select_slider('Confidence',CONF,value=(int(existing['confidence']) if existing else 3));go=st.form_submit_button('Submit / update live vote',type='primary')
             if go:
                 if diag is None or mgmt is None:st.error('Complete diagnosis and management.')
-                else:save_live_vote(code,row.case_id,diag,mgmt,cf);st.success('Vote recorded.');st.rerun()
+                else:save_live_vote(code,row.case_id,diag,mgmt,cf);st.success('Vote recorded.');st.rerun(scope='fragment')
         else:st.warning('Voting is closed.')
         if sess['reveal_results']:
             V=frames()['live'];v=V[V.case_id==row.case_id];st.subheader('Live results');st.metric('Votes',len(v));
             if not v.empty:st.bar_chart(v.management.value_counts())
             st.write(f'Expert: **{row.expert_management}** · TIDE: **{row.tide_management}**')
+    live_body()
 elif mode=='Self-Learning':
     st.header('Self-Learning')
     if 'learning_uid' not in st.session_state:
@@ -87,10 +87,24 @@ else:
             for b in BIOMARKERS:H[b+'_correct']=H[b.lower()].astype(str).str.lower()==H[b.lower()+'_current'].astype(str).str.lower()
             st.dataframe(H.groupby('user_id')[['management_correct','diagnosis_correct']+[b+'_correct' for b in BIOMARKERS]].mean().reset_index(),width='stretch',hide_index=True)
     with t4:
-        sess=get_live_session();ids=CASES.case_id.tolist();sel=st.selectbox('Select case',ids,index=ids.index(sess['active_case_id']) if sess['active_case_id'] in ids else 0);preview=CASES[CASES.case_id==sel].iloc[0];c1,c2,c3,c4=st.columns(4)
-        if c1.button('1 · Open case',type='primary'):update_live(active_case_id=sel,voting_open=False,reveal_results=False);st.rerun()
-        if c2.button('2 · Open voting'):update_live(voting_open=True,reveal_results=False);st.rerun()
-        if c3.button('3 · Close voting'):update_live(voting_open=False,reveal_results=False);st.rerun()
-        if c4.button('4 · Reveal results'):update_live(voting_open=False,reveal_results=True);st.rerun()
-        if sess['active_case_id']:st.metric('Votes received',live_vote_count(sess['active_case_id']))
+        sess=get_live_session();ids=CASES.case_id.tolist();sel=st.selectbox('Select case',ids,index=ids.index(sess['active_case_id']) if sess['active_case_id'] in ids else 0);preview=CASES[CASES.case_id==sel].iloc[0]
+        votes_now=live_vote_count(sess['active_case_id']) if sess['active_case_id'] else 0
+        if not sess['active_case_id']:phase='none'
+        elif sess['voting_open']:phase='voting'
+        elif sess['reveal_results']:phase='revealed'
+        elif votes_now>0:phase='closed_pending_reveal'
+        else:phase='case_open'
+        phase_label={'none':'Chưa mở ca nào','case_open':'Ca đang mở · sẵn sàng mở bình chọn','voting':'🔴 ĐANG MỞ BÌNH CHỌN','closed_pending_reveal':'Đã đóng bình chọn · sẵn sàng công bố kết quả','revealed':'✅ ĐÃ CÔNG BỐ KẾT QUẢ'}
+        st.info(f'Trạng thái hiện tại: **{phase_label[phase]}**')
+        c1,c2,c3,c4=st.columns(4)
+        if c1.button('1 · Open case',type=('primary' if phase=='none' else 'secondary')):update_live(active_case_id=sel,voting_open=False,reveal_results=False);st.rerun()
+        if c2.button('2 · Open voting',type=('primary' if phase=='case_open' else 'secondary')):update_live(voting_open=True,reveal_results=False);st.rerun()
+        if c3.button('3 · Close voting',type=('primary' if phase=='voting' else 'secondary')):update_live(voting_open=False,reveal_results=False);st.rerun()
+        if c4.button('4 · Reveal results',type=('primary' if phase=='closed_pending_reveal' else 'secondary')):update_live(voting_open=False,reveal_results=True);st.rerun()
+        @st.fragment(run_every='2s')
+        def live_votes_panel():
+            s=get_live_session()
+            if s['active_case_id']:st.metric('Votes received',live_vote_count(s['active_case_id']));st.caption('Auto-refresh 2 s')
+            else:st.info('No case is open yet.')
+        live_votes_panel()
         st.subheader('Case Preview');show_case(preview,False)
