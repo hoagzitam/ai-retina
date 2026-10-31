@@ -5,7 +5,9 @@ Everything here is imported with `from src.ui import *` in streamlit_app.py,
 so DIAGNOSES / BIOMARKERS / MANAGEMENT / CONF live here as the single
 source of truth for form options.
 """
+
 import io
+from html import escape
 
 import numpy as np
 import streamlit as st
@@ -99,29 +101,53 @@ def _synthetic_oct_image(row, width=640, height=360) -> Image.Image:
     for li, base_y in enumerate(layer_ys):
         phase = rng.uniform(0, 2 * np.pi)
         amp = rng.uniform(3, 9)
-        ys = base_y + amp * np.sin(xs / 55.0 + phase) + rng.normal(0, 1.2, size=xs.shape)
+        ys = (
+            base_y + amp * np.sin(xs / 55.0 + phase) + rng.normal(0, 1.2, size=xs.shape)
+        )
         pts = [(round(x), round(y)) for x, y in zip(xs.tolist(), ys.tolist())]
         shade = 90 + li * 22
         draw.line(pts, fill=min(shade, 235), width=2)
 
-    ped = str(getattr(row, "tide_ped", "Absent")) == "Present" or str(getattr(row, "ped_current", "Absent")) == "Present"
-    irf = str(getattr(row, "tide_irf", "Absent")) == "Present" or str(getattr(row, "irf_current", "Absent")) == "Present"
-    srf = str(getattr(row, "tide_srf", "Absent")) == "Present" or str(getattr(row, "srf_current", "Absent")) == "Present"
-    hrf = str(getattr(row, "tide_hrf", "Absent")) == "Present" or str(getattr(row, "hrf_current", "Absent")) == "Present"
-    shrm = str(getattr(row, "tide_shrm", "Absent")) == "Present" or str(getattr(row, "shrm_current", "Absent")) == "Present"
+    ped = (
+        str(getattr(row, "tide_ped", "Absent")) == "Present"
+        or str(getattr(row, "ped_current", "Absent")) == "Present"
+    )
+    irf = (
+        str(getattr(row, "tide_irf", "Absent")) == "Present"
+        or str(getattr(row, "irf_current", "Absent")) == "Present"
+    )
+    srf = (
+        str(getattr(row, "tide_srf", "Absent")) == "Present"
+        or str(getattr(row, "srf_current", "Absent")) == "Present"
+    )
+    hrf = (
+        str(getattr(row, "tide_hrf", "Absent")) == "Present"
+        or str(getattr(row, "hrf_current", "Absent")) == "Present"
+    )
+    shrm = (
+        str(getattr(row, "tide_shrm", "Absent")) == "Present"
+        or str(getattr(row, "shrm_current", "Absent")) == "Present"
+    )
 
     cx = width * rng.uniform(0.4, 0.6)
     if ped:
         w_, h_ = rng.uniform(70, 110), rng.uniform(18, 30)
-        draw.ellipse([cx - w_ / 2, height * 0.62 - h_, cx + w_ / 2, height * 0.62 + h_ * 0.4], fill=170)
+        draw.ellipse(
+            [cx - w_ / 2, height * 0.62 - h_, cx + w_ / 2, height * 0.62 + h_ * 0.4],
+            fill=170,
+        )
     if irf:
         for _ in range(int(rng.integers(2, 4))):
             ox = cx + rng.uniform(-60, 60)
             w_, h_ = rng.uniform(14, 26), rng.uniform(10, 18)
-            draw.ellipse([ox - w_ / 2, height * 0.45, ox + w_ / 2, height * 0.45 + h_], fill=25)
+            draw.ellipse(
+                [ox - w_ / 2, height * 0.45, ox + w_ / 2, height * 0.45 + h_], fill=25
+            )
     if srf:
         w_, h_ = rng.uniform(60, 100), rng.uniform(10, 16)
-        draw.ellipse([cx - w_ / 2, height * 0.56, cx + w_ / 2, height * 0.56 + h_], fill=20)
+        draw.ellipse(
+            [cx - w_ / 2, height * 0.56, cx + w_ / 2, height * 0.56 + h_], fill=20
+        )
     if hrf:
         for _ in range(int(rng.integers(6, 12))):
             px = cx + rng.uniform(-90, 90)
@@ -131,7 +157,9 @@ def _synthetic_oct_image(row, width=640, height=360) -> Image.Image:
         gap_x = cx + rng.uniform(-20, 20)
         draw.rectangle([gap_x - 18, height * 0.58, gap_x + 18, height * 0.63], fill=60)
 
-    draw.text((10, height - 18), "Synthetic demo scan \u2014 not real patient data", fill=180)
+    draw.text(
+        (10, height - 18), "Synthetic demo scan \u2014 not real patient data", fill=180
+    )
     return img.convert("RGB")
 
 
@@ -139,21 +167,44 @@ def show_case(row, interactive: bool = True):
     """Render a case: synthetic OCT image + vignette, and (only when
     interactive=False, i.e. the admin/moderator preview) the answer key.
     """
+    from src.private_cases import CaseDataError, case_images
+
     left, right = st.columns([2, 1])
     with left:
-        img = _synthetic_oct_image(row)
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        st.image(buf.getvalue(), caption=f"Case {row.case_id} \u00b7 {row.disease_module}", width="stretch")
+        if getattr(row, "is_real", False):
+            try:
+                images = case_images(row.case_id, tuple(row.image_paths))
+            except CaseDataError as error:
+                st.error(str(error))
+                st.stop()
+            for number, image in enumerate(images, 1):
+                st.image(
+                    image,
+                    caption=f"Case {row.case_id} · image {number}",
+                    width="stretch",
+                )
+        else:
+            from src.config import APP_ENV
+
+            if APP_ENV == "production":
+                st.error("Synthetic cases are disabled in production.")
+                st.stop()
+            img = _synthetic_oct_image(row)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            st.image(
+                buf.getvalue(),
+                caption="Synthetic demo scan — not real patient data",
+                width="stretch",
+            )
     with right:
         st.markdown(
             f"""
             <div class="case-card">
-            <b>Case {row.case_id}</b><br>
-            Module: {row.disease_module}<br>
+            <b>Case {escape(str(row.case_id))}</b><br>
             Age / sex: {row.age} / {row.sex}<br>
-            Eye: {row.eye} &middot; VA: {row.visual_acuity}<br><br>
-            {row.vignette}
+            Eye: {row.eye} &middot; VA: {escape(str(row.visual_acuity))}<br><br>
+            {escape(str(row.vignette))}
             </div>
             """,
             unsafe_allow_html=True,
@@ -165,10 +216,14 @@ def show_case(row, interactive: bool = True):
         with c1:
             st.write(f"Expert diagnosis: **{row.expert_diagnosis}**")
             st.write(f"Expert management: **{row.expert_management}**")
-            bios = ", ".join(f"{b}: {getattr(row, b.lower() + '_current')}" for b in BIOMARKERS)
+            bios = ", ".join(
+                f"{b}: {getattr(row, b.lower() + '_current')}" for b in BIOMARKERS
+            )
             st.caption(f"Current biomarkers \u2014 {bios}")
         with c2:
             st.write(f"TIDE AI diagnosis: **{row.tide_diagnosis}**")
             st.write(f"TIDE AI management: **{row.tide_management}**")
-            bios_ai = ", ".join(f"{b}: {getattr(row, 'tide_' + b.lower())}" for b in BIOMARKERS)
+            bios_ai = ", ".join(
+                f"{b}: {getattr(row, 'tide_' + b.lower())}" for b in BIOMARKERS
+            )
             st.caption(f"AI-read biomarkers \u2014 {bios_ai}")

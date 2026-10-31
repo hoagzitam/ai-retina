@@ -9,6 +9,7 @@ public functions used by streamlit_app.py live here:
     new_code, get_live_session, update_live, get_live_vote, save_live_vote,
     live_vote_count, save_learning, frames
 """
+
 import json
 import secrets as pysecrets
 import string
@@ -27,6 +28,8 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    inspect,
+    func,
     delete,
     insert,
     select,
@@ -37,6 +40,10 @@ from sqlalchemy import (
 from sqlalchemy.pool import NullPool
 
 from src.config import DATABASE_URL
+from contextlib import contextmanager
+from uuid import uuid4
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 BIOMARKER_COLS = ["irf", "srf", "ped", "shrm", "hrf"]
 
@@ -91,6 +98,7 @@ live_session = Table(
     metadata,
     Column("id", Integer, primary_key=True),
     Column("active_case_id", String(32), nullable=True),
+    Column("round_id", String(32), nullable=True),
     Column("voting_open", Boolean, nullable=False, default=False),
     Column("reveal_results", Boolean, nullable=False, default=False),
     Column("updated_at", DateTime, nullable=True),
@@ -107,6 +115,37 @@ live_votes = Table(
     Column("confidence", Integer, nullable=False),
     Column("created_at", DateTime, nullable=False),
     UniqueConstraint("code", "case_id", name="uq_live_vote_code_case"),
+)
+
+
+# Keep historical live_votes unchanged. New rounds preserve repeated-case ballots.
+live_participants = Table(
+    "live_participants",
+    metadata,
+    Column("code", String(32), primary_key=True),
+    Column("created_at", DateTime, nullable=False),
+)
+
+
+live_rounds = Table(
+    "live_rounds",
+    metadata,
+    Column("round_id", String(32), primary_key=True),
+    Column("case_id", String(32), nullable=False),
+    Column("created_at", DateTime, nullable=False),
+)
+live_round_votes = Table(
+    "live_round_votes",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("round_id", String(32), nullable=False),
+    Column("code", String(32), nullable=False),
+    Column("case_id", String(32), nullable=False),
+    Column("diagnosis", String(64), nullable=False),
+    Column("management", String(64), nullable=False),
+    Column("confidence", Integer, nullable=False),
+    Column("created_at", DateTime, nullable=False),
+    UniqueConstraint("round_id", "code", name="uq_live_round_code"),
 )
 
 
@@ -130,7 +169,7 @@ def _engine():
     return create_engine(
         DATABASE_URL,
         poolclass=NullPool,
-        connect_args={"prepare_threshold": None},
+        connect_args={"prepare_threshold": None, "connect_timeout": 10},
     )
 
 
@@ -144,57 +183,80 @@ def _now():
 _ADVISORY_LOCK_KEY = 785421
 
 
-@st.cache_resource(show_spinner=False)
-def init_db():
-    """Create tables if needed, and ensure the singleton live_session row exists.
+def _initialize_schema():
+    """One transaction owns DDL, additive migration and singleton creation.
 
-    Cached with st.cache_resource so this body runs at most once per running
-    app process -- Streamlit reruns the whole script on every interaction
-    and every new browser session, so without this, many concurrent first
-    page-loads could all race to CREATE TABLE at once and collide. The
-    Postgres advisory lock is a second layer of protection across process
-    boundaries; any duplicate-object error is swallowed since it only means
-    another process already finished the same setup.
+    Transaction-scoped locks stay on the same backend through Supavisor.
+    Unexpected database/permission errors propagate; they are never success.
     """
     eng = _engine()
-    is_pg = eng.dialect.name == "postgresql"
-    conn = eng.connect()
-    try:
-        if is_pg:
-            conn.execute(text("SELECT pg_advisory_lock(:k)"), {"k": _ADVISORY_LOCK_KEY})
-        try:
-            metadata.create_all(conn)
-            conn.commit()
-        except Exception:
-            conn.rollback()  # tables already exist (created by a concurrent process) -- fine
-        finally:
-            if is_pg:
-                conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _ADVISORY_LOCK_KEY})
-                conn.commit()
-    finally:
-        conn.close()
+    with _write_connection() as conn:
+        if eng.dialect.name == "postgresql":
+            conn.execute(
+                text("SELECT pg_advisory_xact_lock(:k)"), {"k": _ADVISORY_LOCK_KEY}
+            )
+        metadata.create_all(conn)
+        if "round_id" not in {
+            c["name"] for c in inspect(conn).get_columns("live_session")
+        }:
+            conn.execute(
+                text("ALTER TABLE live_session ADD COLUMN round_id VARCHAR(32)")
+            )
+        stmt = (
+            _insert_for(conn, live_session)
+            .values(
+                id=1,
+                active_case_id=None,
+                round_id=None,
+                voting_open=False,
+                reveal_results=False,
+                updated_at=_now(),
+            )
+            .on_conflict_do_nothing(index_elements=["id"])
+        )
+        conn.execute(stmt)
+        # A legacy open case is closed during migration, without deleting votes.
+        conn.execute(
+            update(live_session)
+            .where(live_session.c.round_id.is_(None))
+            .values(voting_open=False, reveal_results=False)
+        )
 
-    # Make sure the singleton live_session row (id=1) always exists.
-    with eng.begin() as conn2:
-        row = conn2.execute(select(live_session).where(live_session.c.id == 1)).mappings().first()
-        if row is None:
+
+@st.cache_resource(show_spinner=False)
+def init_db():
+    _initialize_schema()
+
+
+@contextmanager
+def _write_connection():
+    eng = _engine()
+    if eng.dialect.name == "sqlite":
+        with eng.connect() as conn:
+            conn.exec_driver_sql("BEGIN IMMEDIATE")
             try:
-                conn2.execute(
-                    insert(live_session).values(
-                        id=1, active_case_id=None, voting_open=False, reveal_results=False, updated_at=_now()
-                    )
-                )
+                yield conn
+                conn.commit()
             except Exception:
-                pass  # another process already inserted it -- fine
+                conn.rollback()
+                raise
+    else:
+        with eng.begin() as conn:
+            yield conn
+
+
+def _insert_for(conn, table):
+    return (pg_insert if conn.dialect.name == "postgresql" else sqlite_insert)(table)
 
 
 def new_code(prefix: str = "USR") -> str:
     alphabet = string.ascii_uppercase + string.digits
-    suffix = "".join(pysecrets.choice(alphabet) for _ in range(6))
+    suffix = "".join(pysecrets.choice(alphabet) for _ in range(12))
     return f"{prefix}-{suffix}"
 
 
 # --- Users / research / learning ---------------------------------------
+
 
 def create_user(role: str, years: int, specialty: str, frequency: str) -> str:
     uid = new_code("RES" if role == "research" else "LRN")
@@ -222,10 +284,17 @@ def assign_cases(uid: str, cases_df: pd.DataFrame, study: str):
         pool = cases_df
     else:
         pool = cases_df[cases_df.disease_module == study]
-        if pool.empty:  # fall back so a bad/unknown filter never breaks the flow
-            pool = cases_df
-    case_ids = pool["case_id"].sample(frac=1).tolist()  # shuffle
-    with _engine().begin() as conn:
+        if pool.empty:
+            raise ValueError("No cases are available for that study.")
+    case_ids = pool["case_id"].sample(frac=1).tolist()
+    with _write_connection() as conn:
+        user = (
+            conn.execute(select(users).where(users.c.user_id == uid).with_for_update())
+            .mappings()
+            .first()
+        )
+        if not user or user["assigned_cases"]:
+            raise ValueError("Participant is missing or already assigned.")
         conn.execute(
             update(users)
             .where(users.c.user_id == uid)
@@ -235,7 +304,9 @@ def assign_cases(uid: str, cases_df: pd.DataFrame, study: str):
 
 def next_research_case(uid: str, cases_df: pd.DataFrame):
     with _engine().begin() as conn:
-        row = conn.execute(select(users).where(users.c.user_id == uid)).mappings().first()
+        row = (
+            conn.execute(select(users).where(users.c.user_id == uid)).mappings().first()
+        )
     if row is None or not row["assigned_cases"]:
         return None, 0
     case_ids = json.loads(row["assigned_cases"])
@@ -249,24 +320,55 @@ def next_research_case(uid: str, cases_df: pd.DataFrame):
     return match.iloc[0], progress + 1
 
 
+def resume_research(uid):
+    with _engine().connect() as conn:
+        row = (
+            conn.execute(
+                select(users).where(users.c.user_id == uid, users.c.role == "research")
+            )
+            .mappings()
+            .first()
+        )
+    return bool(row and row["assigned_cases"])
+
+
 def save_research(uid, row, diag, mgmt, cf, bio, duration_sec):
-    with _engine().begin() as conn:
-        urow = conn.execute(select(users).where(users.c.user_id == uid)).mappings().first()
-        seq = (urow["progress"] if urow else 0) + 1
+    _validate_answer(diag, mgmt, cf)
+    with _write_connection() as conn:
+        urow = (
+            conn.execute(select(users).where(users.c.user_id == uid).with_for_update())
+            .mappings()
+            .first()
+        )
+        if not urow or urow["role"] != "research" or not urow["assigned_cases"]:
+            raise ValueError("Research participant is not assigned.")
+        case_ids = json.loads(urow["assigned_cases"])
+        progress = urow["progress"]
+        if progress >= len(case_ids) or case_ids[progress] != row.case_id:
+            raise ValueError(
+                "This case was already submitted or the assignment changed."
+            )
         values = dict(
             user_id=uid,
             case_id=row.case_id,
-            seq=seq,
+            seq=progress + 1,
             diagnosis=diag,
             management=mgmt,
             confidence=int(cf),
-            duration_sec=int(duration_sec) if duration_sec is not None else None,
+            duration_sec=(
+                max(0, int(duration_sec)) if duration_sec is not None else None
+            ),
             created_at=_now(),
         )
-        for b in BIOMARKER_COLS:
-            values[b] = bio.get(b.upper(), bio.get(b))
+        for biomarker in BIOMARKER_COLS:
+            value = bio.get(biomarker.upper(), bio.get(biomarker))
+            if value not in {"Absent", "Present"}:
+                raise ValueError("Complete all biomarkers.")
+            values[biomarker] = value
         conn.execute(insert(research_responses).values(**values))
-        conn.execute(update(users).where(users.c.user_id == uid).values(progress=seq))
+        conn.execute(
+            update(users).where(users.c.user_id == uid).values(progress=progress + 1)
+        )
 
 
 def save_learning(uid, row, stage_num, stage, diag, mgmt, cf, bio):
@@ -288,25 +390,83 @@ def save_learning(uid, row, stage_num, stage, diag, mgmt, cf, bio):
 
 # --- Live conference -----------------------------------------------------
 
+
 def get_live_session() -> dict:
     with _engine().begin() as conn:
-        row = conn.execute(select(live_session).where(live_session.c.id == 1)).mappings().first()
+        row = (
+            conn.execute(select(live_session).where(live_session.c.id == 1))
+            .mappings()
+            .first()
+        )
     if row is None:
         return {"active_case_id": None, "voting_open": False, "reveal_results": False}
     return dict(row)
 
 
 def update_live(**kwargs):
-    kwargs["updated_at"] = _now()
-    with _engine().begin() as conn:
-        conn.execute(update(live_session).where(live_session.c.id == 1).values(**kwargs))
+    allowed = {"active_case_id", "voting_open", "reveal_results"}
+    if not kwargs or set(kwargs) - allowed:
+        raise ValueError("Invalid moderator action.")
+    with _write_connection() as conn:
+        current = (
+            conn.execute(
+                select(live_session).where(live_session.c.id == 1).with_for_update()
+            )
+            .mappings()
+            .one()
+        )
+        if "active_case_id" in kwargs:
+            case_id = kwargs["active_case_id"]
+            if not case_id or len(case_id) > 32:
+                raise ValueError("Select a valid case first.")
+            round_id = uuid4().hex
+            conn.execute(
+                insert(live_rounds).values(
+                    round_id=round_id, case_id=case_id, created_at=_now()
+                )
+            )
+            kwargs.update(round_id=round_id, voting_open=False, reveal_results=False)
+        elif not current["active_case_id"] or not current["round_id"]:
+            raise ValueError("Open a case before changing voting status.")
+        if kwargs.get("voting_open") and current["reveal_results"]:
+            raise ValueError("Open a new round before accepting votes after reveal.")
+        if kwargs.get("reveal_results") and current["voting_open"]:
+            raise ValueError("Close voting before revealing results.")
+        kwargs["updated_at"] = _now()
+        conn.execute(
+            update(live_session).where(live_session.c.id == 1).values(**kwargs)
+        )
 
 
-def get_live_vote(code: str, case_id: str):
+def create_live_participant():
+    code = new_code("LIVE")
     with _engine().begin() as conn:
+        conn.execute(insert(live_participants).values(code=code, created_at=_now()))
+    return code
+
+
+def resume_live_participant(code):
+    with _engine().connect() as conn:
+        return (
+            conn.execute(
+                select(live_participants.c.code).where(live_participants.c.code == code)
+            ).scalar_one_or_none()
+            is not None
+        )
+
+
+def get_live_vote(code, case_id):
+    with _engine().connect() as conn:
+        round_id = conn.execute(
+            select(live_session.c.round_id).where(live_session.c.id == 1)
+        ).scalar()
         row = (
             conn.execute(
-                select(live_votes).where(live_votes.c.code == code, live_votes.c.case_id == case_id)
+                select(live_round_votes).where(
+                    live_round_votes.c.code == code,
+                    live_round_votes.c.case_id == case_id,
+                    live_round_votes.c.round_id == round_id,
+                )
             )
             .mappings()
             .first()
@@ -314,41 +474,95 @@ def get_live_vote(code: str, case_id: str):
     return dict(row) if row else None
 
 
-def save_live_vote(code: str, case_id: str, diag: str, mgmt: str, cf: int):
-    with _engine().begin() as conn:
-        existing = (
+def _validate_answer(diag, mgmt, cf):
+    from src.ui import DIAGNOSES, MANAGEMENT, CONF
+
+    if diag not in DIAGNOSES or mgmt not in MANAGEMENT or cf not in CONF:
+        raise ValueError("Complete diagnosis, management and confidence.")
+
+
+def save_live_vote(code, case_id, diag, mgmt, cf, expected_round_id):
+    _validate_answer(diag, mgmt, cf)
+    if not code or len(code) > 32:
+        raise ValueError("Participant code is invalid.")
+    with _write_connection() as conn:
+        current = (
             conn.execute(
-                select(live_votes).where(live_votes.c.code == code, live_votes.c.case_id == case_id)
+                select(live_session).where(live_session.c.id == 1).with_for_update()
             )
             .mappings()
-            .first()
+            .one()
         )
-        if existing:
-            conn.execute(
-                update(live_votes)
-                .where(live_votes.c.code == code, live_votes.c.case_id == case_id)
-                .values(diagnosis=diag, management=mgmt, confidence=int(cf), created_at=_now())
+        if (
+            not current["voting_open"]
+            or current["reveal_results"]
+            or current["active_case_id"] != case_id
+            or not expected_round_id
+            or current["round_id"] != expected_round_id
+        ):
+            raise ValueError(
+                "Voting is closed or the moderator changed the case. Refresh the page."
             )
-        else:
-            conn.execute(
-                insert(live_votes).values(
-                    code=code,
-                    case_id=case_id,
-                    diagnosis=diag,
-                    management=mgmt,
-                    confidence=int(cf),
-                    created_at=_now(),
-                )
+        values = dict(
+            code=code,
+            case_id=case_id,
+            round_id=expected_round_id,
+            diagnosis=diag,
+            management=mgmt,
+            confidence=int(cf),
+            created_at=_now(),
+        )
+        stmt = _insert_for(conn, live_round_votes).values(**values)
+        conn.execute(
+            stmt.on_conflict_do_update(
+                index_elements=["round_id", "code"],
+                set_={
+                    key: value
+                    for key, value in values.items()
+                    if key not in {"round_id", "code"}
+                },
             )
+        )
 
 
-def live_vote_count(case_id: str) -> int:
+def live_vote_count(case_id):
+    with _engine().connect() as conn:
+        return conn.execute(
+            select(func.count())
+            .select_from(live_round_votes)
+            .where(
+                live_round_votes.c.case_id == case_id,
+                live_round_votes.c.round_id
+                == select(live_session.c.round_id)
+                .where(live_session.c.id == 1)
+                .scalar_subquery(),
+            )
+        ).scalar_one()
+
+
+def live_results(case_id):
+    """Aggregate only the current revealed round; never export participant data."""
     with _engine().begin() as conn:
-        rows = conn.execute(select(live_votes.c.code).where(live_votes.c.case_id == case_id)).all()
-    return len({r[0] for r in rows})
+        current = (
+            conn.execute(select(live_session).where(live_session.c.id == 1))
+            .mappings()
+            .one()
+        )
+        if not current["reveal_results"] or current["active_case_id"] != case_id:
+            return pd.DataFrame(columns=["management", "votes"])
+        return pd.read_sql(
+            select(live_round_votes.c.management, func.count().label("votes"))
+            .where(
+                live_round_votes.c.case_id == case_id,
+                live_round_votes.c.round_id == current["round_id"],
+            )
+            .group_by(live_round_votes.c.management),
+            conn,
+        )
 
 
 # --- Bulk read for analytics / admin -------------------------------------
+
 
 def frames() -> dict:
     eng = _engine()
@@ -356,5 +570,11 @@ def frames() -> dict:
         u = pd.read_sql(select(users), conn)
         r = pd.read_sql(select(research_responses), conn)
         l = pd.read_sql(select(learning_responses), conn)
-        v = pd.read_sql(select(live_votes), conn)
+        legacy = pd.read_sql(select(live_votes), conn)
+        current = pd.read_sql(select(live_round_votes), conn)
+        v = (
+            pd.concat([legacy, current], ignore_index=True)
+            if not legacy.empty
+            else current
+        )
     return {"users": u, "research": r, "learning": l, "live": v}
