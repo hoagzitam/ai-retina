@@ -90,8 +90,13 @@ _COLUMNS = [
 ]
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def case_bank() -> pd.DataFrame:
+    from src import config
+    if config.APP_ENV == "production" or config.CASE_MANIFEST_PATH:
+        from src.private_cases import private_case_bank
+        return private_case_bank()
     df = pd.DataFrame(_RAW_CASES, columns=_COLUMNS)
+    df["is_real"] = False
     df["seed"] = df["case_id"].apply(lambda c: sum(ord(ch) for ch in c))
     return df

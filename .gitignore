@@ -15,3 +15,14 @@ venv/
 .DS_Store
 .vscode/
 .idea/
+
+# Local credentials and private clinical data
+.env
+.env.*
+!.env.example
+private_cases/
+case-data/
+local-data/
+*.dcm
+*.dicom
+.pytest_cache/
